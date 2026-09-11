@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""TYUT 校园网认证协议（Dr.COM）。
+
+状态查询（chkstatus）、登录端点级联（eportal 804/803、旧 CGI）、eportal 参数
+XOR 加密与应答判定。校园网更换认证方式时只需替换本模块。
+"""
+
+import json
+import logging
+import re
+from typing import NamedTuple
+
+import requests
+
+PORTAL = "drcom.tyut.edu.cn"
+STATUS_URL = f"https://{PORTAL}/drcom/chkstatus?callback=dr1001&jsVersion=4.X&v=8249&lang=zh"
+SECRET_KEY = "drcom"        # 与 portal 的 a41.js 一致：encryption_type=1, secret_key='drcom'
+TIMEOUT = (5, 10)           # (连接, 读取) 秒
+JSONP_RE = re.compile(r"^[^(]*\((.*)\)\s*;?\s*$", re.S)
+ONLINE_HINTS = ("已在线", "已经在线", "online")
+# eportal 返回 result=0 但 msg 属于服务端/Portal侧临时故障的信号词：
+# 值得换端点+退避重试，而不是当业务拒绝停住
+TRANSIENT_MSGS = ("认证超时", "超时", "繁忙", "temporarily", "timeout")
+
+log = logging.getLogger("tyut.drcom")
+DUMP = False                # 由 tyut_login.py 按 --dump 设置
+
+
+def dump_raw(label: str, resp) -> None:
+    if DUMP:
+        log.info("%s 原始响应: %s", label, resp.text.strip()[:800])
+
+
+class Endpoint(NamedTuple):
+    name: str
+    url: str
+    style: str      # eportal = 参数需 XOR 加密；legacy = 明文参数
+
+
+# 登录端点候选，按序尝试；成功的那个会被提到最前（缓存）
+ENDPOINTS = [
+    Endpoint("eportal:804", f"https://{PORTAL}:804/eportal/portal/login", "eportal"),
+    Endpoint("eportal:803", f"http://{PORTAL}:803/eportal/portal/login", "eportal"),
+    Endpoint("legacy:443", f"https://{PORTAL}/drcom/login", "legacy"),
+]
+
+
+def xor_key(text: str) -> int:
+    key = 0
+    for ch in text:
+        key ^= ord(ch)
+    return key
+
+
+def enc(text: str, key: int) -> str:
+    return "".join(f"{ord(c) ^ key:02x}" for c in text)
+
+
+def parse_jsonp(text: str) -> dict:
+    m = JSONP_RE.match(text.strip())
+    return json.loads(m.group(1) if m else text)
+
+
+def build_params(ep: Endpoint, user: str, password: str, ip: str) -> dict:
+    if ep.style == "eportal":
+        key = xor_key(SECRET_KEY)
+        return {
+            "callback": enc("dr1005", key),
+            "login_method": enc("1", key),
+            "user_account": enc(user, key),
+            "user_password": enc(password, key),
+            "wlan_user_ip": enc(ip, key),
+            "wlan_user_ipv6": "",
+            "wlan_user_mac": enc("000000000000", key),
+            "wlan_ac_ip": "",
+            "wlan_ac_name": "",
+            "mac_type": enc("0", key),
+            "authex_enable": "",
+            "jsVersion": enc("4.3", key),
+            "web": enc("0", key),
+            "terminal_type": enc("1", key),
+            "enable_r3": enc("0", key),
+            "encrypt": "1",
+            "v": "10327",
+        }
+    return {                       # 旧 CGI：明文参数
+        "callback": "dr1003",
+        "DDDDD": user,
+        "upass": password,
+        "0MKKey": "123456",
+        "R1": "0", "R2": "", "R3": "0", "R6": "0", "para": "00",
+        "v6ip": "", "terminal_type": "1", "lang": "zh-cn",
+        "jsVersion": "4.1.3", "v": "1234",
+        "wlan_user_ip": ip,
+    }
+
+
+def is_success(data: dict) -> bool:
+    if data.get("result") == 1:
+        return True
+    msg = str(data.get("msg") or data.get("msga") or "")
+    return any(hint in msg for hint in ONLINE_HINTS)
+
+
+def is_transient(msg: str) -> bool:
+    """服务端临时故障类应答（认证超时/系统繁忙等）：换端点或下轮重试可能成功"""
+    low = msg.lower()
+    return any(t in low for t in TRANSIENT_MSGS)
+
+
+def mask_url(url: str) -> str:
+    """日志里隐去密码字段（eportal 的 user_password / 旧 CGI 的 upass）"""
+    return re.sub(r"(user_password=|upass=)[^&]*", r"\1***", url)
+
+
+def request(session, url, params=None):
+    """带超时；TLS 校验失败降级重试一次（认证前 AC 可能换成自签证书）"""
+    try:
+        return session.get(url, params=params, timeout=TIMEOUT)
+    except requests.exceptions.SSLError:
+        log.warning("TLS 校验失败，降级 verify=False 重试：%s", url)
+        return session.get(url, params=params, timeout=TIMEOUT, verify=False)
+
+
+def fetch_status(session) -> dict:
+    resp = request(session, STATUS_URL)
+    resp.raise_for_status()
+    dump_raw("chkstatus", resp)
+    return parse_jsonp(resp.text)
+
+
+def client_ip(status: dict) -> str:
+    """取 IP 的顺序与 portal 的 a41.js 一致"""
+    for key in ("v46ip", "ss5", "v4ip"):
+        value = status.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def try_login(session, user, password, ip, endpoints) -> tuple[bool, str, str]:
+    """按序尝试登录端点。
+
+    只有服务器给出"明确应答"（成功 或 密码错/账号限制等业务拒绝）才停止换端点；
+    连不上/返回非 JSON/认证超时类服务端故障 → 换下一个端点，全部失败则保留
+    最后一条说明交给外层退避重试。密码错时仍在第一个端点即停，不触发风控。
+    """
+    last = None
+    for i, ep in enumerate(endpoints):
+        try:
+            resp = request(session, ep.url, params=build_params(ep, user, password, ip))
+            dump_raw(ep.name, resp)
+            data = parse_jsonp(resp.text)
+        except (requests.RequestException, ValueError) as exc:
+            log.debug("端点 %s 不可用：%s", ep.name, exc)
+            last = (f"{ep.name}：{type(exc).__name__}", f"{ep.name} 异常：{exc}")
+            continue
+        msg = str(data.get("msg") or data.get("msga") or "")
+        code = data.get("result")
+        detail = f"{ep.name} result={code} msg={msg or '(空)'}"
+        brief = f"{ep.name}：{msg}" if msg else f"{ep.name}：result={code}"
+        if is_transient(msg):
+            log.debug("端点 %s 服务端临时故障（%s），尝试下一端点", ep.name, msg)
+            last = (brief, detail)
+            continue
+        if i:
+            endpoints.insert(0, endpoints.pop(i))      # 明确应答的端点提到最前
+        if is_success(data):
+            return True, ep.name, detail
+        return False, brief, detail
+    if last is None:
+        return False, "所有端点不可用", "所有登录端点都不可用（网络 / 端口 / 解析失败）"
+    return False, last[0], last[1]
