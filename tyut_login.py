@@ -159,7 +159,9 @@ class Stats(object):
 def parse_env_file(path):
     """返回 (user, password) 元组，缺项为空串"""
     user = password = ""
-    for line in path.read_text(encoding="utf-8").splitlines():
+    with path.open(encoding="utf-8") as envf:
+        lines = envf.read().splitlines()
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
