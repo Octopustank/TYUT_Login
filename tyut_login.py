@@ -15,6 +15,8 @@
     python3 tyut_login.py --once -v --dump    # 调试：流水 + 原始应答
 
 凭证优先级：--user/--password > 环境变量 TYUT_USER/TYUT_PASS > 脚本同目录 .env
+
+兼容 Python 3.4：无 f-string、无内置泛型注解。
 """
 
 import argparse
@@ -46,22 +48,22 @@ log = logging.getLogger("tyut")
 ONCE = False        # --once：手动单轮模式
 
 
-def heartbeat(msg, *args) -> None:
+def heartbeat(msg, *args):
     """每分钟心跳流水：平时 DEBUG，--once 手动跑时打到 INFO。"""
     (log.info if ONCE else log.debug)(msg, *args)
 
 
-def fmt_dur(seconds: float) -> str:
+def fmt_dur(seconds):
     """时长可读化：42m / 1h04m / 13h31m"""
     s = int(seconds)
     if s < 3600:
-        return f"{s // 60}m"
-    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+        return "{}m".format(s // 60)
+    return "{:d}h{:02d}m".format(s // 3600, (s % 3600) // 60)
 
 
 # ---------- 连通性探测与复核 ----------
 
-def probe_ok(session) -> bool:
+def probe_ok(session):
     """轻量连通性探测：portal 说在线 ≠ 真能上网（IP 变了 / 会话僵死也会 result=1）"""
     for url in PROBE_URLS:
         try:
@@ -74,14 +76,14 @@ def probe_ok(session) -> bool:
     return False
 
 
-def verify_after_login(session, probe: bool) -> tuple[bool, str]:
+def verify_after_login(session, probe):
     """重登后的复核：result=1 且（未关闭时）探测通过，才算真的回来了。"""
     try:
         again = fetch_status(session)
     except (requests.RequestException, ValueError):
         return False, "status re-check failed"
     if again.get("result") != 1:
-        return False, f"result={again.get('result')}"
+        return False, "result={}".format(again.get("result"))
     if probe and not probe_ok(session):
         return False, "204 probe failed"
     return True, ""
@@ -89,7 +91,7 @@ def verify_after_login(session, probe: bool) -> tuple[bool, str]:
 
 # ---------- 环境门闸 ----------
 
-def parse_prefixes(text: str) -> list:
+def parse_prefixes(text):
     """解析 --campus-prefix（逗号分隔 CIDR）；空串 = 关掉门闸。"""
     nets = []
     for part in (text or "").split(","):
@@ -99,11 +101,11 @@ def parse_prefixes(text: str) -> list:
         try:
             nets.append(ipaddress.ip_network(part, strict=False))
         except ValueError:
-            sys.exit(f"校网段格式不对：{part!r}（应为 CIDR，如 {CAMPUS_PREFIX_DEFAULT}）")
+            sys.exit("校网段格式不对：{!r}（应为 CIDR，如 {}）".format(part, CAMPUS_PREFIX_DEFAULT))
     return nets
 
 
-def ip_in_campus(ip: str, networks: list):
+def ip_in_campus(ip, networks):
     """True/False = 在/不在校网段；None = IP 无法解析（门闸放行，外层打警告）。"""
     try:
         addr = ipaddress.ip_address(ip)
@@ -114,7 +116,7 @@ def ip_in_campus(ip: str, networks: list):
 
 # ---------- 运行统计（每小时汇总） ----------
 
-class Stats:
+class Stats(object):
     def __init__(self):
         self.state = "startup"
         self.state_since = time.monotonic()
@@ -123,7 +125,7 @@ class Stats:
         self.loginfail = 0
         self.silent_probes = 0
 
-    def set_state(self, state: str) -> bool:
+    def set_state(self, state):
         """记录状态；返回是否发生了转移。"""
         if state == self.state:
             return False
@@ -131,27 +133,30 @@ class Stats:
         self.state_since = time.monotonic()
         return True
 
-    def summary(self) -> str:
+    def summary(self):
         """一行运行状况：常态只报状态+持续时长，有事件才展开计数。"""
         held = fmt_dur(time.monotonic() - self.state_since)
         events = []
         if self.drops:
-            events.append(f"drop {self.drops}")
+            events.append("drop {}".format(self.drops))
         if self.relogins:
-            events.append(f"re-login OK {self.relogins}")
+            events.append("re-login OK {}".format(self.relogins))
         if self.loginfail:
-            events.append(f"login fail {self.loginfail}")
+            events.append("login fail {}".format(self.loginfail))
         if self.silent_probes:
-            events.append(f"silent probe {self.silent_probes}")
-        line = f"hourly: {self.state} for {held}; " + (
-            ", ".join(events) if events else "no events")
+            events.append("silent probe {}".format(self.silent_probes))
+        line = "hourly: {} for {}; ".format(self.state, held)
+        if events:
+            line += ", ".join(events)
+        else:
+            line += "no events"
         self.drops = self.relogins = self.loginfail = self.silent_probes = 0
         return line
 
 
 # ---------- 主流程 ----------
 
-def parse_env_file(path: Path):
+def parse_env_file(path):
     """返回 (user, password) 元组，缺项为空串"""
     user = password = ""
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -185,11 +190,11 @@ def load_credentials(args):
     return user, password
 
 
-def backoff(args, failures: int) -> int:
+def backoff(args, failures):
     return min(args.retry_max, args.retry_base * (2 ** max(0, failures - 1)))
 
 
-def run(args) -> int:
+def run(args):
     user, password = load_credentials(args)
     networks = parse_prefixes(args.campus_prefix)
     session = requests.Session()
@@ -319,7 +324,7 @@ def run(args) -> int:
         time.sleep(wait)
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description="TYUT 校园网保活")
     parser.add_argument("--once", action="store_true", help="只跑一轮后退出（手动测试）")
     parser.add_argument("-v", "--verbose", action="store_true",

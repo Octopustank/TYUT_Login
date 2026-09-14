@@ -4,17 +4,20 @@
 
 状态查询（chkstatus）、登录端点级联（eportal 804/803、旧 CGI）、eportal 参数
 XOR 加密与应答判定。校园网更换认证方式时只需替换本模块。
+
+兼容 Python 3.4：无 f-string、无内置泛型注解，Endpoint 用 collections.namedtuple。
 """
 
+import collections
 import json
 import logging
 import re
-from typing import NamedTuple
 
 import requests
 
 PORTAL = "drcom.tyut.edu.cn"
-STATUS_URL = f"https://{PORTAL}/drcom/chkstatus?callback=dr1001&jsVersion=4.X&v=8249&lang=zh"
+STATUS_URL = ("https://" + PORTAL
+              + "/drcom/chkstatus?callback=dr1001&jsVersion=4.X&v=8249&lang=zh")
 SECRET_KEY = "drcom"        # 与 portal 的 a41.js 一致：encryption_type=1, secret_key='drcom'
 TIMEOUT = (5, 10)           # (连接, 读取) 秒
 JSONP_RE = re.compile(r"^[^(]*\((.*)\)\s*;?\s*$", re.S)
@@ -27,42 +30,40 @@ log = logging.getLogger("tyut.drcom")
 DUMP = False                # 由 tyut_login.py 按 --dump 设置
 
 
-def dump_raw(label: str, resp) -> None:
+def dump_raw(label, resp):
     if DUMP:
-        log.info("%s 原始响应: %s", label, resp.text.strip()[:800])
+        log.info("%s raw response: %s", label, resp.text.strip()[:800])
 
 
-class Endpoint(NamedTuple):
-    name: str
-    url: str
-    style: str      # eportal = 参数需 XOR 加密；legacy = 明文参数
+# name/url/style：eportal = 参数需 XOR 加密；legacy = 明文参数
+Endpoint = collections.namedtuple("Endpoint", ("name", "url", "style"))
 
 
 # 登录端点候选，按序尝试；成功的那个会被提到最前（缓存）
 ENDPOINTS = [
-    Endpoint("eportal:804", f"https://{PORTAL}:804/eportal/portal/login", "eportal"),
-    Endpoint("eportal:803", f"http://{PORTAL}:803/eportal/portal/login", "eportal"),
-    Endpoint("legacy:443", f"https://{PORTAL}/drcom/login", "legacy"),
+    Endpoint("eportal:804", "https://" + PORTAL + ":804/eportal/portal/login", "eportal"),
+    Endpoint("eportal:803", "http://" + PORTAL + ":803/eportal/portal/login", "eportal"),
+    Endpoint("legacy:443", "https://" + PORTAL + "/drcom/login", "legacy"),
 ]
 
 
-def xor_key(text: str) -> int:
+def xor_key(text):
     key = 0
     for ch in text:
         key ^= ord(ch)
     return key
 
 
-def enc(text: str, key: int) -> str:
-    return "".join(f"{ord(c) ^ key:02x}" for c in text)
+def enc(text, key):
+    return "".join("{:02x}".format(ord(c) ^ key) for c in text)
 
 
-def parse_jsonp(text: str) -> dict:
+def parse_jsonp(text):
     m = JSONP_RE.match(text.strip())
     return json.loads(m.group(1) if m else text)
 
 
-def build_params(ep: Endpoint, user: str, password: str, ip: str) -> dict:
+def build_params(ep, user, password, ip):
     if ep.style == "eportal":
         key = xor_key(SECRET_KEY)
         return {
@@ -96,25 +97,25 @@ def build_params(ep: Endpoint, user: str, password: str, ip: str) -> dict:
     }
 
 
-def is_success(data: dict) -> bool:
+def is_success(data):
     if data.get("result") == 1:
         return True
     msg = str(data.get("msg") or data.get("msga") or "")
     return any(hint in msg for hint in ONLINE_HINTS)
 
 
-def is_transient(msg: str) -> bool:
+def is_transient(msg):
     """服务端临时故障类应答（认证超时/系统繁忙等）：换端点或下轮重试可能成功"""
     low = msg.lower()
     return any(t in low for t in TRANSIENT_MSGS)
 
 
-def mask_url(url: str) -> str:
+def mask_url(url):
     """日志里隐去密码字段（eportal 的 user_password / 旧 CGI 的 upass）"""
     return re.sub(r"(user_password=|upass=)[^&]*", r"\1***", url)
 
 
-def describe_exc(exc: Exception) -> str:
+def describe_exc(exc):
     """把 requests 的长异常归成一句人话（原文降 DEBUG，日志不糊堆栈文本）。"""
     text = str(exc)
     if isinstance(exc, requests.exceptions.SSLError) or "SSL" in text:
@@ -144,14 +145,14 @@ def request(session, url, params=None):
         return session.get(url, params=params, timeout=TIMEOUT, verify=False)
 
 
-def fetch_status(session) -> dict:
+def fetch_status(session):
     resp = request(session, STATUS_URL)
     resp.raise_for_status()
     dump_raw("chkstatus", resp)
     return parse_jsonp(resp.text)
 
 
-def client_ip(status: dict) -> str:
+def client_ip(status):
     """取 IP 的顺序与 portal 的 a41.js 一致"""
     for key in ("v46ip", "ss5", "v4ip"):
         value = status.get(key)
@@ -160,7 +161,7 @@ def client_ip(status: dict) -> str:
     return ""
 
 
-def try_login(session, user, password, ip, endpoints) -> tuple[bool, str, str]:
+def try_login(session, user, password, ip, endpoints):
     """按序尝试登录端点。
 
     只有服务器给出"明确应答"（成功 或 密码错/账号限制等业务拒绝）才停止换端点；
@@ -175,12 +176,13 @@ def try_login(session, user, password, ip, endpoints) -> tuple[bool, str, str]:
             data = parse_jsonp(resp.text)
         except (requests.RequestException, ValueError) as exc:
             log.debug("endpoint %s unavailable: %s", ep.name, exc)
-            last = (f"{ep.name}: {type(exc).__name__}", f"{ep.name} exception: {exc}")
+            last = ("{}: {}".format(ep.name, type(exc).__name__),
+                    "{} exception: {}".format(ep.name, exc))
             continue
         msg = str(data.get("msg") or data.get("msga") or "")
         code = data.get("result")
-        detail = f"{ep.name} result={code} msg={msg or '(空)'}"
-        brief = f"{ep.name}: {msg}" if msg else f"{ep.name}: result={code}"
+        detail = "{} result={} msg={}".format(ep.name, code, msg or "(empty)")
+        brief = "{}: {}".format(ep.name, msg) if msg else "{}: result={}".format(ep.name, code)
         if is_transient(msg):
             log.debug("endpoint %s transient server fault (%s), trying next", ep.name, msg)
             last = (brief, detail)
