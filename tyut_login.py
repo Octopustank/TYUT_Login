@@ -24,13 +24,13 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import requests
 
 import drcom
-from drcom import ENDPOINTS, TIMEOUT, build_params, client_ip, fetch_status, mask_url, try_login
+from drcom import (ENDPOINTS, PORTAL, TIMEOUT, build_params, client_ip,
+                   describe_exc, fetch_status, mask_url, try_login)
 
 ENV_FILE = Path(__file__).resolve().parent / ".env"   # 脚本同目录
 PROBE_URLS = (
@@ -51,6 +51,14 @@ def heartbeat(msg, *args) -> None:
     (log.info if ONCE else log.debug)(msg, *args)
 
 
+def fmt_dur(seconds: float) -> str:
+    """时长可读化：42m / 1h04m / 13h31m"""
+    s = int(seconds)
+    if s < 3600:
+        return f"{s // 60}m"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 # ---------- 连通性探测与复核 ----------
 
 def probe_ok(session) -> bool:
@@ -60,9 +68,9 @@ def probe_ok(session) -> bool:
             resp = session.get(url, timeout=TIMEOUT, allow_redirects=False)
             if resp.status_code == 204:
                 return True
-            log.debug("探测 %s -> HTTP %s", url, resp.status_code)
+            log.debug("probe %s -> HTTP %s", url, resp.status_code)
         except requests.RequestException as exc:
-            log.debug("探测 %s 失败：%s", url, exc)
+            log.debug("probe %s failed: %s", url, exc)
     return False
 
 
@@ -71,11 +79,11 @@ def verify_after_login(session, probe: bool) -> tuple[bool, str]:
     try:
         again = fetch_status(session)
     except (requests.RequestException, ValueError):
-        return False, "复核请求失败"
+        return False, "status re-check failed"
     if again.get("result") != 1:
         return False, f"result={again.get('result')}"
     if probe and not probe_ok(session):
-        return False, "204 未通过"
+        return False, "204 probe failed"
     return True, ""
 
 
@@ -108,7 +116,7 @@ def ip_in_campus(ip: str, networks: list):
 
 class Stats:
     def __init__(self):
-        self.state = "启动"
+        self.state = "startup"
         self.state_since = time.monotonic()
         self.drops = 0
         self.relogins = 0
@@ -124,10 +132,19 @@ class Stats:
         return True
 
     def summary(self) -> str:
-        held = int(time.monotonic() - self.state_since)
-        line = (f"近1小时：掉线 {self.drops} 次、重登成功 {self.relogins}、"
-                f"登录失败 {self.loginfail}、静默重探 {self.silent_probes} 轮；"
-                f"当前 {self.state} 已持续 {held}s")
+        """一行运行状况：常态只报状态+持续时长，有事件才展开计数。"""
+        held = fmt_dur(time.monotonic() - self.state_since)
+        events = []
+        if self.drops:
+            events.append(f"drop {self.drops}")
+        if self.relogins:
+            events.append(f"re-login OK {self.relogins}")
+        if self.loginfail:
+            events.append(f"login fail {self.loginfail}")
+        if self.silent_probes:
+            events.append(f"silent probe {self.silent_probes}")
+        line = f"hourly: {self.state} for {held}; " + (
+            ", ".join(events) if events else "no events")
         self.drops = self.relogins = self.loginfail = self.silent_probes = 0
         return line
 
@@ -184,16 +201,16 @@ def run(args) -> int:
     skipped = False     # 客户端 IP 不在校网段：跳过登录，只观察
     last_summary = time.monotonic()
 
-    log.info("启动：账号=%s 端点=%s 活跃=%ss 稳定=%ss 校网段=%s 探测=%s",
-             user, "、".join(e.name for e in endpoints), args.interval, args.steady,
-             args.campus_prefix or "(关)", "开" if args.probe else "关")
+    log.info("start (pid=%d) account=%s endpoints=%s interval=%ds steady=%ds "
+             "campus=%s probe=%s",
+             os.getpid(), user, ",".join(e.name for e in endpoints),
+             args.interval, args.steady, args.campus_prefix or "off",
+             "on" if args.probe else "off")
 
     while True:
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         if time.monotonic() - last_summary >= SUMMARY_EVERY:
             last_summary = time.monotonic()
-            log.info("[%s] 汇总 %s", stamp, stats.summary())
+            log.info("%s", stats.summary())
 
         # —— 状态查询（环境门：不可达 → 静默，只重探不登录）——
         try:
@@ -204,16 +221,18 @@ def run(args) -> int:
             if not silent:
                 silent = True
                 stable_streak = 0
-                stats.set_state("静默（校园网不可达）")
-                log.info("[%s] 校园网不可达（%s），转静默：每 %ss 重探，不登录",
-                         stamp, exc, args.steady)
+                stats.set_state("silent (portal unreachable)")
+                log.info("portal unreachable (%s, %s:443), silent mode: "
+                         "re-probe every %ds, no login",
+                         describe_exc(exc), PORTAL, args.steady)
+                log.debug("portal error detail: %s", exc)
             if args.once:
                 return 1
             time.sleep(args.retry_base if failures == 1 else args.steady)
             continue
         if silent:
             silent = False
-            log.info("[%s] 校园网恢复可达", stamp)
+            log.info("portal reachable again")
 
         online = status.get("result") == 1
         ip = args.ip or client_ip(status)
@@ -222,19 +241,19 @@ def run(args) -> int:
         if online and (not args.probe or probe_ok(session)):
             failures = 0
             stable_streak += 1
-            stats.set_state("在线")
-            heartbeat("[%s] 在线 ip=%s actt=%ss flow=%s",
-                      stamp, ip, status.get("actt"), status.get("flow"))
+            stats.set_state("online")
+            heartbeat("online ip=%s session=%ss traffic=%s",
+                      ip, status.get("actt"), status.get("flow"))
             if args.once:
                 return 0
             time.sleep(args.steady if stable_streak >= STABLE_AFTER else args.interval)
             continue
 
         # —— 未登录 / 探测失败：准备重登 ——
-        prefix = "在线但探测失败（204 未通过）" if online else "检测到未登录"
+        prefix = "online but probe failed (no 204)" if online else "offline detected"
 
         if not ip:
-            log.error("[%s] %s（客户端 IP 获取失败），跳过本轮", stamp, prefix)
+            log.error("%s (client IP unavailable), skip this round", prefix)
             failures += 1
             if args.once:
                 return 1
@@ -244,28 +263,29 @@ def run(args) -> int:
         if networks and not args.ip:        # --ip 手动指定时视为调试，放行门闸
             verdict = ip_in_campus(ip, networks)
             if verdict is None:
-                log.warning("[%s] 客户端 IP 无法解析（%r），门闸放行", stamp, ip)
+                log.warning("client IP not parseable (%r), gate open", ip)
             elif not verdict:
                 if not skipped:
                     skipped = True
-                    log.warning("[%s] %s（客户端 IP %s 不在校网段），跳过登录", stamp, prefix, ip)
-                stats.set_state("跳过（IP 非校网段）")
+                    log.warning("%s (client IP %s outside %s), login skipped, "
+                                "observing only", prefix, ip, args.campus_prefix)
+                stats.set_state("skipped (IP outside campus)")
                 if args.once:
                     return 1
                 time.sleep(args.steady)
                 continue
             elif skipped:
                 skipped = False
-                log.info("[%s] 客户端 IP 回到校网段（%s）", stamp, ip)
+                log.info("client IP back in campus range (%s)", ip)
 
-        if stats.set_state("重登中"):
+        if stats.set_state("re-login"):
             stats.drops += 1
             stable_streak = 0
 
         if args.dry_run:
             req = requests.Request("GET", endpoints[0].url,
                                    params=build_params(endpoints[0], user, password, ip))
-            log.info("[%s] dry-run：本应登录 %s", stamp, mask_url(str(req.prepare().url)))
+            log.info("dry-run: would login %s", mask_url(str(req.prepare().url)))
             return 0
 
         ok, brief, detail = try_login(session, user, password, ip, endpoints)
@@ -276,23 +296,23 @@ def run(args) -> int:
                 failures = 0
                 stable_streak = 0
                 stats.relogins += 1
-                stats.set_state("在线")
-                log.info("[%s] %s，重登成功（%s，复核通过）", stamp, prefix, brief)
+                stats.set_state("online")
+                log.info("%s, re-login OK (%s, verified)", prefix, brief)
                 if args.once:
                     return 0
                 time.sleep(args.interval)
                 continue
             failures += 1
             wait = backoff(args, failures)
-            log.warning("[%s] %s，重登应答成功但复核未通过（%s），%ss 后重试",
-                        stamp, prefix, check, wait)
-            log.debug("复核详情：%s", detail)
+            log.warning("%s, login accepted but re-check failed (%s), "
+                        "retry in %ds", prefix, check, wait)
+            log.debug("re-check detail: %s", detail)
         else:
             stats.loginfail += 1
             failures += 1
             wait = backoff(args, failures)
-            log.error("[%s] %s，重登失败（%s），%ss 后重试", stamp, prefix, brief, wait)
-            log.debug("重登详情：%s", detail)
+            log.error("%s, re-login FAILED (%s), retry in %ds", prefix, brief, wait)
+            log.debug("re-login detail: %s", detail)
 
         if args.once:
             return 1
@@ -328,14 +348,14 @@ def main() -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,          # StreamHandler 每条都 flush，重定向到文件也不会丢日志
     )
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         return run(args)
     except KeyboardInterrupt:
-        log.info("已停止")
+        log.info("stopped")
         return 130
 
 

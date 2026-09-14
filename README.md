@@ -54,6 +54,11 @@ python3 tyut_login.py --once -v --dump
 - `./run.sh` → 同目录 `logs.txt`（已 gitignore，方便整体清理）
 - 默认只写**事件**（掉线 / 重登 / 门闸切换）与**每小时汇总**；
   `-v` 加回每分钟流水；`--dump` 打印服务端原始应答。
+- 运行日志为纯 ASCII 英文（服务端返回的 msg 原文除外），带完整日期时间戳；
+  异常归类成短句（`read timeout` / `TLS connection interrupted`），
+  requests 原始长文本降到 DEBUG。
+- 每小时汇总一行结论：无事件时 `hourly: online for 2h35m; no events`，
+  有事件才展开计数（`drop 1, re-login OK 1, silent probe 2`）。
 
 ## 凭证
 

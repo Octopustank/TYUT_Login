@@ -114,12 +114,33 @@ def mask_url(url: str) -> str:
     return re.sub(r"(user_password=|upass=)[^&]*", r"\1***", url)
 
 
+def describe_exc(exc: Exception) -> str:
+    """把 requests 的长异常归成一句人话（原文降 DEBUG，日志不糊堆栈文本）。"""
+    text = str(exc)
+    if isinstance(exc, requests.exceptions.SSLError) or "SSL" in text:
+        if "UNEXPECTED_EOF" in text:
+            return "TLS connection interrupted"
+        if "CERTIFICATE_VERIFY_FAILED" in text:
+            return "TLS certificate verify failed"
+        return "TLS error"
+    if "Read timed out" in text:
+        return "read timeout"
+    if "Connect timed out" in text:
+        return "connect timeout"
+    if "Connection refused" in text:
+        return "connection refused"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "connection error"
+    return type(exc).__name__
+
+
 def request(session, url, params=None):
     """带超时；TLS 校验失败降级重试一次（认证前 AC 可能换成自签证书）"""
     try:
         return session.get(url, params=params, timeout=TIMEOUT)
-    except requests.exceptions.SSLError:
-        log.warning("TLS 校验失败，降级 verify=False 重试：%s", url)
+    except requests.exceptions.SSLError as exc:
+        log.warning("TLS verify failed (%s), retrying with verify=False: %s",
+                    describe_exc(exc), url.split("?")[0])
         return session.get(url, params=params, timeout=TIMEOUT, verify=False)
 
 
@@ -153,15 +174,15 @@ def try_login(session, user, password, ip, endpoints) -> tuple[bool, str, str]:
             dump_raw(ep.name, resp)
             data = parse_jsonp(resp.text)
         except (requests.RequestException, ValueError) as exc:
-            log.debug("端点 %s 不可用：%s", ep.name, exc)
-            last = (f"{ep.name}：{type(exc).__name__}", f"{ep.name} 异常：{exc}")
+            log.debug("endpoint %s unavailable: %s", ep.name, exc)
+            last = (f"{ep.name}: {type(exc).__name__}", f"{ep.name} exception: {exc}")
             continue
         msg = str(data.get("msg") or data.get("msga") or "")
         code = data.get("result")
         detail = f"{ep.name} result={code} msg={msg or '(空)'}"
-        brief = f"{ep.name}：{msg}" if msg else f"{ep.name}：result={code}"
+        brief = f"{ep.name}: {msg}" if msg else f"{ep.name}: result={code}"
         if is_transient(msg):
-            log.debug("端点 %s 服务端临时故障（%s），尝试下一端点", ep.name, msg)
+            log.debug("endpoint %s transient server fault (%s), trying next", ep.name, msg)
             last = (brief, detail)
             continue
         if i:
@@ -170,5 +191,5 @@ def try_login(session, user, password, ip, endpoints) -> tuple[bool, str, str]:
             return True, ep.name, detail
         return False, brief, detail
     if last is None:
-        return False, "所有端点不可用", "所有登录端点都不可用（网络 / 端口 / 解析失败）"
+        return False, "all endpoints unavailable", "no login endpoint reachable (network / port / parse)"
     return False, last[0], last[1]
